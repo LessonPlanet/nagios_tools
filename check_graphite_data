@@ -26,6 +26,12 @@ def usage():
     print '\t-L --critlower\t\t\tLower Holt-Winters band breach causes a crit,'
     print '\t\t\t\t\t- breaching upper band causes a warn'
     print '\t(If neither -U nor -L are given, we will always warn)'
+    print '\t-p --percent\t\t\tPercentage of data sources which must breach a threshold'
+    print '\t\t\t\t\tbefore any alert is thrown (requires multiple -u or --url options)'
+    print '\t(If multiple -u options are specified and -p is not, defaults to 0%, i.e.'
+    print '\tany data source breaching threshold will cause an alert)'
+    print '\t-N <crit|warn> --none=<crit|warn>\tTreat None (missing) values as crit or warn threshold breaches.'
+    print '\t(Default is to ignore None values)'
 
 
 def pull_graphite_data(url):
@@ -47,14 +53,13 @@ def eval_graphite_data(data, seconds):
     # First, if the number of seconds of data we want to examine is smaller or
     # equals the graphite sample period, just grab the latest data point.
     # If that data point is None, grab the one before it.
-    # If that is None too, return 0.0.
     if seconds <= sample_period:
         if eval(all_data_points[-1]):
             data_value = float(all_data_points[-1])
         elif eval(all_data_points[-2]):
             data_value = float(all_data_points[-2])
         else:
-            data_value = 0.0
+            data_value = None
     else:
     # Second, if we requested more than on graphite sample period, work out how
     # many sample periods we wanted (python always rounds division *down*)
@@ -64,7 +69,7 @@ def eval_graphite_data(data, seconds):
         if data_set:
             data_value = float( sum(data_set) / len(data_set) )
         else:
-            data_value = 0.0
+            data_value = None
     return data_value
 
 
@@ -93,10 +98,10 @@ def get_value(url, seconds=0):
 
 def main(argv):
     try:
-        opts, args = getopt.getopt(argv, 'hWULru:c:w:s:',
+        opts, args = getopt.getopt(argv, 'hWULru:c:w:s:p:N:',
                                     ['help', 'holt-winters', 'critupper',
                                      'critlower', 'url=', 'crit=', 'warn=',
-                                     'seconds=', 'd1=', 'd2='])
+                                     'seconds=', 'd1=', 'd2=', 'percent=', 'none='])
     except getopt.GetoptError, err:
         print str(err)
         sys.exit(STATE_UNKNOWN)
@@ -111,12 +116,17 @@ def main(argv):
     hw = None
     critupper = None
     critlower = None
+    percent = 0.00
+    none_treatment = None 
     for opt, arg in opts:
         if opt in ('-h', '--help'):
             usage()
             sys.exit()
         elif opt in ('-u', '--url'):
-            url = arg
+            if url == None:
+                url = [arg]
+            else:
+                url.append(arg)
         elif opt in ('-w', '--warn'):
             warn = float(arg)
         elif opt in ('-c', '--crit'):
@@ -135,6 +145,10 @@ def main(argv):
             critupper = True
         elif opt in ('-L', '--critlower'):
             critlower = True
+        elif opt in ('-p', '--percent'):
+            percent = int(arg) / 100.0
+        elif opt in ('-N', '--none'):
+            none_treatment = arg
     if not hw and ((url == None) or (warn == None) or (crit == None)) \
             and not diff1 and not diff2:
         usage()
@@ -144,8 +158,15 @@ def main(argv):
         usage()
         sys.exit(STATE_UNKNOWN)
 
+    if none_treatment not in (None, 'warn', 'crit'):
+        usage()
+        sys.exit(STATE_UNKNOWN)
+
     if hw:
-        graphite_data, graphite_lower, graphite_upper = get_hw_value(url, seconds)
+        if len(url) > 1:
+            print 'Holt-Winters forecast not supported for multiple data sources yet'
+            sys.exit(STATE_UNKNOWN)
+        graphite_data, graphite_lower, graphite_upper = get_hw_value(url[0], seconds)
         print 'Current value: %s, lower band: %s, upper band: %s' % \
                (graphite_data, graphite_lower, graphite_upper)
         if (graphite_data > graphite_upper) or (graphite_data < graphite_lower):
@@ -156,28 +177,53 @@ def main(argv):
         else:
             sys.exit(STATE_OK)
     elif diff1 or diff2:
+        # This will eventually be a special case of multiple data source URLs.
+        # For now we just array-ify the result.
         graphite_data1 = get_value(diff1, seconds)
         graphite_data2 = get_value(diff2, seconds)
-        graphite_data = abs(graphite_data1 - graphite_data2)
+        if graphite_data1 == None or graphite_data2 == None:
+            graphite_data = [None]
+        else:
+            graphite_data = [abs(graphite_data1 - graphite_data2)]
     else:
-        graphite_data = get_value(url, seconds)
+        graphite_data = []
+        for u in url:
+            graphite_data.append(get_value(u, seconds))
 
-    print 'Current value: %s, warn threshold: %s, crit threshold: %s' % \
-           (graphite_data, warn, crit)
-    if reverse == True:
-        if crit >= graphite_data:
-            sys.exit(STATE_CRITICAL)
-        elif warn >= graphite_data:
-            sys.exit(STATE_WARNING)
+    print 'Current value(s): %s; warn threshold: %s, crit threshold: %s' % \
+           (','.join(map((lambda x: str(x)), graphite_data)), warn, crit)
+
+    warn_count = 0
+    crit_count = 0
+    none_count = 0
+    for graphite_datum in graphite_data:
+        if graphite_datum == None:
+            none_count += 1
         else:
-            sys.exit(STATE_OK)
+            if reverse == True:
+                if crit >= graphite_datum:
+                    crit_count += 1
+                elif warn >= graphite_datum:
+                    warn_count += 1
+            else:
+                if graphite_datum >= crit:
+                    crit_count += 1
+                elif graphite_datum >= warn:
+                    warn_count += 1
+
+    # For now, we will treat None values similarly to threshold breaches.
+    # The -N option controls whether we treat them as crit or warn.
+    if none_treatment == 'crit':
+        crit_count += none_count
+    elif none_treatment == 'warn':
+        warn_count += none_count
+
+    if crit_count > (len(url) * percent):
+        sys.exit(STATE_CRITICAL)
+    elif warn_count > (len(url) * percent):
+        sys.exit(STATE_WARNING)
     else:
-        if graphite_data >= crit:
-            sys.exit(STATE_CRITICAL)
-        elif graphite_data >= warn:
-            sys.exit(STATE_WARNING)
-        else:
-            sys.exit(STATE_OK)
+        sys.exit(STATE_OK)
 
 
 if __name__ == '__main__':
